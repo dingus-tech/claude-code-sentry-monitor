@@ -19,6 +19,12 @@ const DEFAULTS = {
   flushIntervalMinutes: 0,
 } as const;
 
+export interface SentryUser {
+  email?: string;
+  id?: string;
+  username?: string;
+}
+
 export interface PluginConfig {
   dsn: string;
   tracesSampleRate?: number;
@@ -31,6 +37,12 @@ export interface PluginConfig {
   enableMetrics?: boolean;
   tags?: Record<string, string>;
   mode?: "batch" | "realtime";
+  /**
+   * Populates Sentry's user context so traces show up under a user (and can be
+   * filtered with `user.email:...`). The plugin otherwise leaves user context
+   * empty. Filter by the `developer` tag instead if you don't set this.
+   */
+  user?: SentryUser;
   /**
    * When > 0, long-lived sessions are flushed to Sentry every N minutes as
    * successive "chapter" transactions instead of only once at SessionEnd.
@@ -53,6 +65,7 @@ export interface ResolvedPluginConfig {
   tags: Record<string, string>;
   mode: "batch" | "realtime";
   flushIntervalMinutes: number;
+  user?: SentryUser;
 }
 
 export interface LoadedPluginConfig {
@@ -107,6 +120,26 @@ function asOptionalTags(value: unknown, fieldName: string): Record<string, strin
     }
   }
   return value as Record<string, string>;
+}
+
+function asOptionalUser(value: unknown, fieldName: string): SentryUser | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`"${fieldName}" must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  const user: SentryUser = {
+    email: asOptionalString(raw.email, `${fieldName}.email`),
+    id: asOptionalString(raw.id, `${fieldName}.id`),
+    username: asOptionalString(raw.username, `${fieldName}.username`),
+  };
+  // Drop entirely if no field was provided.
+  if (!user.email && !user.id && !user.username) {
+    return undefined;
+  }
+  return user;
 }
 
 function parseBooleanEnv(name: string): boolean | undefined {
@@ -210,6 +243,7 @@ function normalizeConfig(raw: Record<string, unknown>): ResolvedPluginConfig {
     tags: asOptionalTags(raw.tags, "tags") ?? DEFAULTS.tags,
     mode,
     flushIntervalMinutes,
+    user: asOptionalUser(raw.user, "user"),
   };
 }
 
@@ -352,6 +386,19 @@ function addEnvOverrides(raw: Record<string, unknown>): Record<string, unknown> 
   const flushIntervalMinutes = parseNumberEnv("CLAUDE_SENTRY_FLUSH_INTERVAL_MINUTES");
   if (flushIntervalMinutes !== undefined) {
     withEnv.flushIntervalMinutes = flushIntervalMinutes;
+  }
+
+  const userEmail = process.env.CLAUDE_SENTRY_USER_EMAIL;
+  const userId = process.env.CLAUDE_SENTRY_USER_ID;
+  const userName = process.env.CLAUDE_SENTRY_USER_NAME;
+  if (userEmail || userId || userName) {
+    const base = (withEnv.user as Record<string, unknown> | undefined) ?? {};
+    withEnv.user = {
+      ...base,
+      ...(userEmail ? { email: userEmail } : {}),
+      ...(userId ? { id: userId } : {}),
+      ...(userName ? { username: userName } : {}),
+    };
   }
 
   if (process.env.SENTRY_ENVIRONMENT) {

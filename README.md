@@ -63,6 +63,7 @@ Config is loaded from the first file found (in order):
 | `tags` | `{}` | Custom key-value tags on every span |
 | `mode` | `batch` | `batch` (process at session end) or `realtime` (local HTTP server) |
 | `flushIntervalMinutes` | `0` | When > 0, flush long-lived sessions every N minutes as "chapter" transactions instead of only at session end. **Required if you keep sessions open indefinitely** — otherwise a session that never ends never reports. `0` keeps the original single-transaction-per-session behaviour. |
+| `user` | — | Sets Sentry user context, e.g. `{ "email": "you@company.com", "username": "you" }`. Lets you filter traces by `user.email:...` and populates Sentry's Users view. Without it, user context is empty — filter by the `developer` tag instead. |
 
 ### Environment variable overrides
 
@@ -79,6 +80,7 @@ Each setting can be overridden via env var:
 | `CLAUDE_SENTRY_TAGS` | `tags` (format: `key1:val1,key2:val2`) |
 | `CLAUDE_SENTRY_MODE` | `mode` |
 | `CLAUDE_SENTRY_FLUSH_INTERVAL_MINUTES` | `flushIntervalMinutes` |
+| `CLAUDE_SENTRY_USER_EMAIL` / `CLAUDE_SENTRY_USER_ID` / `CLAUDE_SENTRY_USER_NAME` | `user.email` / `user.id` / `user.username` |
 | `SENTRY_ENVIRONMENT` | `environment` |
 | `SENTRY_RELEASE` | `release` |
 
