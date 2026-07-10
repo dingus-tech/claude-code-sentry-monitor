@@ -37,7 +37,12 @@ function batchLogPath(sessionId: string): string {
 // ── Transcript token extraction ──────────────────────────────
 
 interface TokenData {
+  /** Fresh prompt tokens: neither read from nor written to the prompt cache. */
   inputTokens: number;
+  /** Tokens written to the prompt cache (Anthropic cache_creation_input_tokens). */
+  cacheCreationTokens: number;
+  /** Tokens served from the prompt cache (Anthropic cache_read_input_tokens). */
+  cacheReadTokens: number;
   outputTokens: number;
   model: string | null;
   prompt: string | null;
@@ -49,6 +54,8 @@ function extractTokensFromTranscript(transcriptPath: string): TokenData | null {
   if (!existsSync(transcriptPath)) return null;
 
   let inputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
   let outputTokens = 0;
   let model: string | null = null;
   let prompt: string | null = null;
@@ -94,10 +101,13 @@ function extractTokensFromTranscript(transcriptPath: string): TokenData | null {
     if (obj.type !== "assistant" || !(obj as any).message?.usage) continue;
 
     const usage = (obj as any).message.usage;
-    inputTokens +=
-      (usage.input_tokens || 0) +
-      (usage.cache_creation_input_tokens || 0) +
-      (usage.cache_read_input_tokens || 0);
+    // Keep the three input buckets separate: they have very different costs, and
+    // in long sessions cache reads dwarf everything else (the same context is
+    // re-read every turn). Collapsing them into one number makes Sentry price
+    // cached tokens at the full input rate.
+    inputTokens += usage.input_tokens || 0;
+    cacheCreationTokens += usage.cache_creation_input_tokens || 0;
+    cacheReadTokens += usage.cache_read_input_tokens || 0;
     outputTokens += usage.output_tokens || 0;
 
     if ((obj as any).message.model) {
@@ -110,7 +120,16 @@ function extractTokensFromTranscript(transcriptPath: string): TokenData | null {
     turnResponses.push(currentTurnResponse);
   }
 
-  return { inputTokens, outputTokens, model, prompt, lastResponse, turnResponses };
+  return {
+    inputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    outputTokens,
+    model,
+    prompt,
+    lastResponse,
+    turnResponses,
+  };
 }
 
 // ── Tool event pairing ───────────────────────────────────────
@@ -197,10 +216,16 @@ function createToolSpan(tool: PairedToolCall, config: ResolvedPluginConfig): voi
 
 // ── Batch mode ───────────────────────────────────────────────
 
+interface TokenTotals {
+  input: number;
+  cacheWrite: number;
+  cacheRead: number;
+  output: number;
+}
+
 interface ChapterCarry {
   chapterIndex: number;
-  offsetInput: number;
-  offsetOutput: number;
+  offset: TokenTotals;
 }
 
 /**
@@ -212,8 +237,12 @@ function readCarry(events: Record<string, unknown>[]): ChapterCarry {
   const start = events.find((e) => e.hook_event_name === "SessionStart");
   return {
     chapterIndex: (start?._chapter as number) || 0,
-    offsetInput: (start?._offsetIn as number) || 0,
-    offsetOutput: (start?._offsetOut as number) || 0,
+    offset: {
+      input: (start?._offsetIn as number) || 0,
+      cacheWrite: (start?._offsetCw as number) || 0,
+      cacheRead: (start?._offsetCr as number) || 0,
+      output: (start?._offsetOut as number) || 0,
+    },
   };
 }
 
@@ -228,7 +257,7 @@ async function emitTransaction(
   config: ResolvedPluginConfig,
   carry: ChapterCarry,
   ongoing: boolean,
-): Promise<{ input: number; output: number }> {
+): Promise<TokenTotals> {
   const sessionStart = events.find((e) => e.hook_event_name === "SessionStart");
   const model = (sessionStart?.model as string) || (events[0]?.model as string) || "claude";
   const sessionId = (sessionStart?.session_id as string) || (events[0]?.session_id as string);
@@ -237,9 +266,11 @@ async function emitTransaction(
     (sessionStart?.transcript_path as string) || (events[0]?.transcript_path as string);
   const tokenData = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
 
-  const cumulative = {
-    input: tokenData?.inputTokens ?? carry.offsetInput,
-    output: tokenData?.outputTokens ?? carry.offsetOutput,
+  const cumulative: TokenTotals = {
+    input: tokenData?.inputTokens ?? carry.offset.input,
+    cacheWrite: tokenData?.cacheCreationTokens ?? carry.offset.cacheWrite,
+    cacheRead: tokenData?.cacheReadTokens ?? carry.offset.cacheRead,
+    output: tokenData?.outputTokens ?? carry.offset.output,
   };
 
   const toolCalls = pairToolEvents(events);
@@ -283,13 +314,34 @@ async function emitTransaction(
 
   // Set token data from session transcript, reported as this chapter's delta.
   if (tokenData) {
-    const chapterInput = Math.max(0, cumulative.input - carry.offsetInput);
-    const chapterOutput = Math.max(0, cumulative.output - carry.offsetOutput);
-    if (chapterInput) {
-      rootSpan.setAttribute("gen_ai.usage.input_tokens", chapterInput);
+    const freshInput = Math.max(0, cumulative.input - carry.offset.input);
+    const cacheWrite = Math.max(0, cumulative.cacheWrite - carry.offset.cacheWrite);
+    const cacheRead = Math.max(0, cumulative.cacheRead - carry.offset.cacheRead);
+    const chapterOutput = Math.max(0, cumulative.output - carry.offset.output);
+
+    // Sentry's cost formula is:
+    //   (input_tokens - cached) * input_rate
+    //   + cached * cached_rate
+    //   + cache_write * cache_write_rate
+    // so input_tokens must include cached reads but NOT cache writes, otherwise
+    // cache writes get billed twice. (OTel semconv would fold cache_creation in
+    // as well; that double-counts under Sentry's formula.)
+    const totalInput = freshInput + cacheRead;
+
+    if (totalInput) {
+      rootSpan.setAttribute("gen_ai.usage.input_tokens", totalInput);
+    }
+    if (cacheRead) {
+      rootSpan.setAttribute("gen_ai.usage.input_tokens.cached", cacheRead);
+    }
+    if (cacheWrite) {
+      rootSpan.setAttribute("gen_ai.usage.input_tokens.cache_write", cacheWrite);
     }
     if (chapterOutput) {
       rootSpan.setAttribute("gen_ai.usage.output_tokens", chapterOutput);
+    }
+    if (totalInput || chapterOutput) {
+      rootSpan.setAttribute("gen_ai.usage.total_tokens", totalInput + chapterOutput);
     }
     if (tokenData.model) {
       rootSpan.setAttribute("gen_ai.response.model", tokenData.model);
@@ -429,6 +481,8 @@ async function processChunk(filePath: string, config: ResolvedPluginConfig): Pro
     _ts: Date.now(),
     _chapter: carry.chapterIndex + 1,
     _offsetIn: cumulative.input,
+    _offsetCw: cumulative.cacheWrite,
+    _offsetCr: cumulative.cacheRead,
     _offsetOut: cumulative.output,
   };
 
