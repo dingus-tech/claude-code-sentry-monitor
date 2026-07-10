@@ -1,8 +1,8 @@
 {
-  "name": "sergical",
-  "description": "Sentry AI Agent Monitoring for Claude Code",
+  "name": "dingus-tech",
+  "description": "Sentry AI Agent Monitoring for Claude Code (dingus-tech fork, adds flushIntervalMinutes for long-lived sessions)",
   "owner": {
-    "name": "Sergiy Dybskiy"
+    "name": "dingus-tech"
   },
   "plugins": [
     {
@@ -14,9 +14,9 @@
       },
       "source": {
         "source": "url",
-        "url": "https://github.com/sergical/claude-code-sentry-monitor.git"
+        "url": "https://github.com/dingus-tech/claude-code-sentry-monitor.git"
       },
-      "homepage": "https://github.com/sergical/claude-code-sentry-monitor",
+      "homepage": "https://github.com/dingus-tech/claude-code-sentry-monitor",
       "category": "monitoring"
     }
   ]
