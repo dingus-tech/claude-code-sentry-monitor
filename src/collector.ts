@@ -1,4 +1,3 @@
-import * as Sentry from "@sentry/node";
 import {
   readFileSync,
   unlinkSync,
@@ -11,6 +10,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig, type ResolvedPluginConfig } from "./config.js";
 import { serializeAttribute } from "./serialize.js";
+
+// @sentry/node is loaded lazily: importing it costs well over a second, and the
+// vast majority of hook invocations (PreToolUse/PostToolUse/UserPromptSubmit in
+// batch mode) only append a line to a JSONL file and never talk to Sentry.
+// Only the paths that actually emit spans call initSentry().
+let Sentry!: typeof import("@sentry/node");
+
+async function initSentry(config: ResolvedPluginConfig): Promise<void> {
+  Sentry = await import("@sentry/node");
+  Sentry.init({
+    dsn: config.dsn,
+    tracesSampleRate: config.tracesSampleRate,
+    environment: config.environment,
+    release: config.release,
+    debug: config.debug,
+  });
+  if (config.user) {
+    Sentry.setUser(config.user);
+  }
+}
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -769,19 +788,6 @@ async function main(): Promise<void> {
 
   const { config } = loaded;
 
-  // Initialize Sentry
-  Sentry.init({
-    dsn: config.dsn,
-    tracesSampleRate: config.tracesSampleRate,
-    environment: config.environment,
-    release: config.release,
-    debug: config.debug,
-  });
-
-  if (config.user) {
-    Sentry.setUser(config.user);
-  }
-
   const timestamped = addTimestamp(event);
   // Normalize: Claude Code sends "sessionEnd" (camelCase) but other events are PascalCase
   const rawHookEvent = event.hook_event_name as string;
@@ -841,6 +847,7 @@ async function main(): Promise<void> {
 
     if (hookEvent === "SessionEnd") {
       // Final flush of whatever remains in the current chapter.
+      await initSentry(config);
       await processBatch(logfile, config);
     } else if (
       config.flushIntervalMinutes > 0 &&
@@ -848,8 +855,10 @@ async function main(): Promise<void> {
     ) {
       // Long-lived session: flush the current chapter and start a fresh one so
       // sessions that never end still report periodically.
+      await initSentry(config);
       await processChunk(logfile, config);
     }
+    // Otherwise we only appended a line — Sentry was never loaded.
   }
 }
 
@@ -857,17 +866,9 @@ async function main(): Promise<void> {
 const [, , command, configArg] = process.argv;
 if (command === "--serve" && configArg) {
   const config = JSON.parse(configArg) as ResolvedPluginConfig;
-  Sentry.init({
-    dsn: config.dsn,
-    tracesSampleRate: config.tracesSampleRate,
-    environment: config.environment,
-    release: config.release,
-    debug: config.debug,
-  });
-  if (config.user) {
-    Sentry.setUser(config.user);
-  }
-  startServer(config);
+  initSentry(config)
+    .then(() => startServer(config))
+    .catch(() => process.exit(0));
 } else {
   main().catch(() => process.exit(0));
 }
