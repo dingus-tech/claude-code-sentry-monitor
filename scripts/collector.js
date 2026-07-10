@@ -563,6 +563,9 @@ async function main() {
         release: config.release,
         debug: config.debug,
     });
+    if (config.user) {
+        Sentry.setUser(config.user);
+    }
     const timestamped = addTimestamp(event);
     // Normalize: Claude Code sends "sessionEnd" (camelCase) but other events are PascalCase
     const rawHookEvent = event.hook_event_name;
@@ -639,6 +642,9 @@ if (command === "--serve" && configArg) {
         release: config.release,
         debug: config.debug,
     });
+    if (config.user) {
+        Sentry.setUser(config.user);
+    }
     startServer(config);
 }
 else {

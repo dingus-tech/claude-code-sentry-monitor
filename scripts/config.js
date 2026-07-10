@@ -60,6 +60,25 @@ function asOptionalTags(value, fieldName) {
     }
     return value;
 }
+function asOptionalUser(value, fieldName) {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`"${fieldName}" must be an object`);
+    }
+    const raw = value;
+    const user = {
+        email: asOptionalString(raw.email, `${fieldName}.email`),
+        id: asOptionalString(raw.id, `${fieldName}.id`),
+        username: asOptionalString(raw.username, `${fieldName}.username`),
+    };
+    // Drop entirely if no field was provided.
+    if (!user.email && !user.id && !user.username) {
+        return undefined;
+    }
+    return user;
+}
 function parseBooleanEnv(name) {
     const value = process.env[name];
     if (value === undefined) {
@@ -142,6 +161,7 @@ function normalizeConfig(raw) {
         tags: asOptionalTags(raw.tags, "tags") ?? DEFAULTS.tags,
         mode,
         flushIntervalMinutes,
+        user: asOptionalUser(raw.user, "user"),
     };
 }
 async function fileExists(filePath) {
@@ -264,6 +284,18 @@ function addEnvOverrides(raw) {
     const flushIntervalMinutes = parseNumberEnv("CLAUDE_SENTRY_FLUSH_INTERVAL_MINUTES");
     if (flushIntervalMinutes !== undefined) {
         withEnv.flushIntervalMinutes = flushIntervalMinutes;
+    }
+    const userEmail = process.env.CLAUDE_SENTRY_USER_EMAIL;
+    const userId = process.env.CLAUDE_SENTRY_USER_ID;
+    const userName = process.env.CLAUDE_SENTRY_USER_NAME;
+    if (userEmail || userId || userName) {
+        const base = withEnv.user ?? {};
+        withEnv.user = {
+            ...base,
+            ...(userEmail ? { email: userEmail } : {}),
+            ...(userId ? { id: userId } : {}),
+            ...(userName ? { username: userName } : {}),
+        };
     }
     if (process.env.SENTRY_ENVIRONMENT) {
         withEnv.environment = process.env.SENTRY_ENVIRONMENT;
