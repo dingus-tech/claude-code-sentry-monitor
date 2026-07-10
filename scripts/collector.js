@@ -28,6 +28,8 @@ function extractTokensFromTranscript(transcriptPath) {
     if (!existsSync(transcriptPath))
         return null;
     let inputTokens = 0;
+    let cacheCreationTokens = 0;
+    let cacheReadTokens = 0;
     let outputTokens = 0;
     let model = null;
     let prompt = null;
@@ -71,10 +73,13 @@ function extractTokensFromTranscript(transcriptPath) {
         if (obj.type !== "assistant" || !obj.message?.usage)
             continue;
         const usage = obj.message.usage;
-        inputTokens +=
-            (usage.input_tokens || 0) +
-                (usage.cache_creation_input_tokens || 0) +
-                (usage.cache_read_input_tokens || 0);
+        // Keep the three input buckets separate: they have very different costs, and
+        // in long sessions cache reads dwarf everything else (the same context is
+        // re-read every turn). Collapsing them into one number makes Sentry price
+        // cached tokens at the full input rate.
+        inputTokens += usage.input_tokens || 0;
+        cacheCreationTokens += usage.cache_creation_input_tokens || 0;
+        cacheReadTokens += usage.cache_read_input_tokens || 0;
         outputTokens += usage.output_tokens || 0;
         if (obj.message.model) {
             model = obj.message.model;
@@ -84,7 +89,16 @@ function extractTokensFromTranscript(transcriptPath) {
     if (inTurn && currentTurnResponse !== null) {
         turnResponses.push(currentTurnResponse);
     }
-    return { inputTokens, outputTokens, model, prompt, lastResponse, turnResponses };
+    return {
+        inputTokens,
+        cacheCreationTokens,
+        cacheReadTokens,
+        outputTokens,
+        model,
+        prompt,
+        lastResponse,
+        turnResponses,
+    };
 }
 function pairToolEvents(events) {
     const preByUseId = new Map();
@@ -160,8 +174,12 @@ function readCarry(events) {
     const start = events.find((e) => e.hook_event_name === "SessionStart");
     return {
         chapterIndex: start?._chapter || 0,
-        offsetInput: start?._offsetIn || 0,
-        offsetOutput: start?._offsetOut || 0,
+        offset: {
+            input: start?._offsetIn || 0,
+            cacheWrite: start?._offsetCw || 0,
+            cacheRead: start?._offsetCr || 0,
+            output: start?._offsetOut || 0,
+        },
     };
 }
 /**
@@ -177,8 +195,10 @@ async function emitTransaction(events, config, carry, ongoing) {
     const transcriptPath = sessionStart?.transcript_path || events[0]?.transcript_path;
     const tokenData = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
     const cumulative = {
-        input: tokenData?.inputTokens ?? carry.offsetInput,
-        output: tokenData?.outputTokens ?? carry.offsetOutput,
+        input: tokenData?.inputTokens ?? carry.offset.input,
+        cacheWrite: tokenData?.cacheCreationTokens ?? carry.offset.cacheWrite,
+        cacheRead: tokenData?.cacheReadTokens ?? carry.offset.cacheRead,
+        output: tokenData?.outputTokens ?? carry.offset.output,
     };
     const toolCalls = pairToolEvents(events);
     const firstTs = events[0]._ts || Date.now() / 1000;
@@ -214,13 +234,32 @@ async function emitTransaction(events, config, carry, ongoing) {
     });
     // Set token data from session transcript, reported as this chapter's delta.
     if (tokenData) {
-        const chapterInput = Math.max(0, cumulative.input - carry.offsetInput);
-        const chapterOutput = Math.max(0, cumulative.output - carry.offsetOutput);
-        if (chapterInput) {
-            rootSpan.setAttribute("gen_ai.usage.input_tokens", chapterInput);
+        const freshInput = Math.max(0, cumulative.input - carry.offset.input);
+        const cacheWrite = Math.max(0, cumulative.cacheWrite - carry.offset.cacheWrite);
+        const cacheRead = Math.max(0, cumulative.cacheRead - carry.offset.cacheRead);
+        const chapterOutput = Math.max(0, cumulative.output - carry.offset.output);
+        // Sentry's cost formula is:
+        //   (input_tokens - cached) * input_rate
+        //   + cached * cached_rate
+        //   + cache_write * cache_write_rate
+        // so input_tokens must include cached reads but NOT cache writes, otherwise
+        // cache writes get billed twice. (OTel semconv would fold cache_creation in
+        // as well; that double-counts under Sentry's formula.)
+        const totalInput = freshInput + cacheRead;
+        if (totalInput) {
+            rootSpan.setAttribute("gen_ai.usage.input_tokens", totalInput);
+        }
+        if (cacheRead) {
+            rootSpan.setAttribute("gen_ai.usage.input_tokens.cached", cacheRead);
+        }
+        if (cacheWrite) {
+            rootSpan.setAttribute("gen_ai.usage.input_tokens.cache_write", cacheWrite);
         }
         if (chapterOutput) {
             rootSpan.setAttribute("gen_ai.usage.output_tokens", chapterOutput);
+        }
+        if (totalInput || chapterOutput) {
+            rootSpan.setAttribute("gen_ai.usage.total_tokens", totalInput + chapterOutput);
         }
         if (tokenData.model) {
             rootSpan.setAttribute("gen_ai.response.model", tokenData.model);
@@ -330,6 +369,8 @@ async function processChunk(filePath, config) {
         _ts: Date.now(),
         _chapter: carry.chapterIndex + 1,
         _offsetIn: cumulative.input,
+        _offsetCw: cumulative.cacheWrite,
+        _offsetCr: cumulative.cacheRead,
         _offsetOut: cumulative.output,
     };
     try {
