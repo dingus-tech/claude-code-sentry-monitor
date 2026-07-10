@@ -41,6 +41,15 @@ function addTimestamp(event) {
 function batchLogPath(sessionId) {
     return join(tmpdir(), `claude-sentry-${sessionId}.jsonl`);
 }
+/**
+ * Per-session token offsets. Deliberately kept OUTSIDE the batch logfile, which
+ * is deleted at SessionEnd: the transcript accumulates across resumes, so a
+ * session that is resumed would otherwise re-report its entire token history
+ * every time it is reopened.
+ */
+function offsetPath(sessionId) {
+    return join(tmpdir(), `claude-sentry-${sessionId}.offset.json`);
+}
 function extractTokensFromTranscript(transcriptPath) {
     if (!existsSync(transcriptPath))
         return null;
@@ -182,22 +191,39 @@ function createToolSpan(tool, config) {
     }
     childSpan.end(tool.endTime);
 }
+const ZERO_CARRY = {
+    chapterIndex: 0,
+    offset: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 },
+};
 /**
- * Read chapter/token-offset carried forward on the (possibly synthetic)
- * SessionStart event. Absent on a first, never-chunked session → chapter 0,
- * zero offset, which reproduces the original single-transaction behaviour.
+ * Read the chapter index and token totals already reported for this session.
+ * Survives SessionEnd so that resuming a session reports only new tokens.
  */
-function readCarry(events) {
-    const start = events.find((e) => e.hook_event_name === "SessionStart");
-    return {
-        chapterIndex: start?._chapter || 0,
-        offset: {
-            input: start?._offsetIn || 0,
-            cacheWrite: start?._offsetCw || 0,
-            cacheRead: start?._offsetCr || 0,
-            output: start?._offsetOut || 0,
-        },
-    };
+function readCarry(sessionId) {
+    try {
+        const raw = readFileSync(offsetPath(sessionId), "utf-8");
+        const parsed = safeJsonParse(raw);
+        if (!parsed)
+            return ZERO_CARRY;
+        return {
+            chapterIndex: parsed.chapter || 0,
+            offset: {
+                input: parsed.input || 0,
+                cacheWrite: parsed.cacheWrite || 0,
+                cacheRead: parsed.cacheRead || 0,
+                output: parsed.output || 0,
+            },
+        };
+    }
+    catch {
+        return ZERO_CARRY;
+    }
+}
+function writeCarry(sessionId, chapterIndex, totals) {
+    try {
+        writeFileSync(offsetPath(sessionId), JSON.stringify({ chapter: chapterIndex, ...totals }));
+    }
+    catch { }
 }
 /**
  * Build the transaction tree for a set of events and flush it to Sentry.
@@ -348,8 +374,11 @@ function readBatchEvents(filePath) {
     const lines = readFileSync(filePath, "utf-8").trim().split("\n");
     return lines.map((line) => safeJsonParse(line)).filter(Boolean);
 }
-/** Final flush (SessionEnd): emit remaining events, then remove the logfile. */
-async function processBatch(filePath, config) {
+/**
+ * Final flush (SessionEnd): emit remaining events, persist the token totals so a
+ * later resume of this session doesn't re-report them, then remove the logfile.
+ */
+async function processBatch(filePath, config, sessionId) {
     const events = readBatchEvents(filePath);
     if (events.length === 0) {
         try {
@@ -358,7 +387,9 @@ async function processBatch(filePath, config) {
         catch { }
         return;
     }
-    await emitTransaction(events, config, readCarry(events), false);
+    const carry = readCarry(sessionId);
+    const cumulative = await emitTransaction(events, config, carry, false);
+    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
     try {
         unlinkSync(filePath);
     }
@@ -370,25 +401,21 @@ async function processBatch(filePath, config) {
  * SessionStart that carries the model, transcript path and token offset forward
  * so the next chapter is a fresh, correctly-accounted transaction.
  */
-async function processChunk(filePath, config) {
+async function processChunk(filePath, config, sessionId) {
     const events = readBatchEvents(filePath);
     // Nothing worth a chapter unless there's real activity beyond the marker.
     if (events.length <= 1)
         return;
-    const carry = readCarry(events);
+    const carry = readCarry(sessionId);
     const cumulative = await emitTransaction(events, config, carry, true);
+    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
     const start = events.find((e) => e.hook_event_name === "SessionStart");
     const carried = {
         hook_event_name: "SessionStart",
-        session_id: start?.session_id || events[0]?.session_id,
+        session_id: sessionId,
         model: start?.model || events[0]?.model,
         transcript_path: start?.transcript_path || events[0]?.transcript_path,
         _ts: Date.now(),
-        _chapter: carry.chapterIndex + 1,
-        _offsetIn: cumulative.input,
-        _offsetCw: cumulative.cacheWrite,
-        _offsetCr: cumulative.cacheRead,
-        _offsetOut: cumulative.output,
     };
     try {
         writeFileSync(filePath, JSON.stringify(carried) + "\n");
@@ -669,14 +696,14 @@ async function main() {
         if (hookEvent === "SessionEnd") {
             // Final flush of whatever remains in the current chapter.
             await initSentry(config);
-            await processBatch(logfile, config);
+            await processBatch(logfile, config, sessionId);
         }
         else if (config.flushIntervalMinutes > 0 &&
             chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000) {
             // Long-lived session: flush the current chapter and start a fresh one so
             // sessions that never end still report periodically.
             await initSentry(config);
-            await processChunk(logfile, config);
+            await processChunk(logfile, config, sessionId);
         }
         // Otherwise we only appended a line — Sentry was never loaded.
     }
