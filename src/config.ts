@@ -16,6 +16,7 @@ const DEFAULTS = {
   maxAttributeLength: 12000,
   enableMetrics: false,
   tags: {} as Record<string, string>,
+  flushIntervalMinutes: 0,
 } as const;
 
 export interface PluginConfig {
@@ -30,6 +31,13 @@ export interface PluginConfig {
   enableMetrics?: boolean;
   tags?: Record<string, string>;
   mode?: "batch" | "realtime";
+  /**
+   * When > 0, long-lived sessions are flushed to Sentry every N minutes as
+   * successive "chapter" transactions instead of only once at SessionEnd.
+   * Required for workflows that keep sessions open indefinitely — with the
+   * default of 0, a session that never ends never reports anything.
+   */
+  flushIntervalMinutes?: number;
 }
 
 export interface ResolvedPluginConfig {
@@ -44,6 +52,7 @@ export interface ResolvedPluginConfig {
   enableMetrics: boolean;
   tags: Record<string, string>;
   mode: "batch" | "realtime";
+  flushIntervalMinutes: number;
 }
 
 export interface LoadedPluginConfig {
@@ -133,7 +142,10 @@ function parseNumberEnv(name: string): number | undefined {
 
 function parseConfigContent(raw: string, source: string): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(stripJsonComments(raw));
+    // Strip a leading UTF-8 BOM — editors/PowerShell on Windows often add one,
+    // and neither stripJsonComments nor JSON.parse tolerate it.
+    const withoutBom = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    const parsed = JSON.parse(stripJsonComments(withoutBom));
 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("Config root must be an object");
@@ -176,6 +188,13 @@ function normalizeConfig(raw: Record<string, unknown>): ResolvedPluginConfig {
   const modeRaw = asOptionalString(raw.mode, "mode");
   const mode = modeRaw === "realtime" ? "realtime" : "batch";
 
+  const flushIntervalMinutes =
+    asOptionalNumber(raw.flushIntervalMinutes, "flushIntervalMinutes") ??
+    DEFAULTS.flushIntervalMinutes;
+  if (!Number.isFinite(flushIntervalMinutes) || flushIntervalMinutes < 0) {
+    throw new Error('"flushIntervalMinutes" must be a number >= 0');
+  }
+
   return {
     dsn,
     tracesSampleRate,
@@ -190,6 +209,7 @@ function normalizeConfig(raw: Record<string, unknown>): ResolvedPluginConfig {
       asOptionalBoolean(raw.enableMetrics, "enableMetrics") ?? DEFAULTS.enableMetrics,
     tags: asOptionalTags(raw.tags, "tags") ?? DEFAULTS.tags,
     mode,
+    flushIntervalMinutes,
   };
 }
 
@@ -327,6 +347,11 @@ function addEnvOverrides(raw: Record<string, unknown>): Record<string, unknown> 
   const modeEnv = process.env.CLAUDE_SENTRY_MODE;
   if (modeEnv) {
     withEnv.mode = modeEnv;
+  }
+
+  const flushIntervalMinutes = parseNumberEnv("CLAUDE_SENTRY_FLUSH_INTERVAL_MINUTES");
+  if (flushIntervalMinutes !== undefined) {
+    withEnv.flushIntervalMinutes = flushIntervalMinutes;
   }
 
   if (process.env.SENTRY_ENVIRONMENT) {

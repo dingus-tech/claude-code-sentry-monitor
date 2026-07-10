@@ -1,6 +1,8 @@
 import * as Sentry from "@sentry/node";
-import { readFileSync, unlinkSync, existsSync, appendFileSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, appendFileSync, writeFileSync, } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadPluginConfig } from "./config.js";
 import { serializeAttribute } from "./serialize.js";
 // ── Helpers ──────────────────────────────────────────────────
@@ -14,6 +16,13 @@ function safeJsonParse(str) {
 }
 function addTimestamp(event) {
     return { ...event, _ts: Date.now() };
+}
+/**
+ * Per-session batch log path. Uses the OS temp dir so it works on Windows too
+ * (the old hardcoded "/tmp" silently dropped everything on Windows).
+ */
+function batchLogPath(sessionId) {
+    return join(tmpdir(), `claude-sentry-${sessionId}.jsonl`);
 }
 function extractTokensFromTranscript(transcriptPath) {
     if (!existsSync(transcriptPath))
@@ -142,24 +151,35 @@ function createToolSpan(tool, config) {
     }
     childSpan.end(tool.endTime);
 }
-// ── Batch mode ───────────────────────────────────────────────
-async function processBatch(filePath, config) {
-    if (!existsSync(filePath)) {
-        return;
-    }
-    const lines = readFileSync(filePath, "utf-8").trim().split("\n");
-    const events = lines.map((line) => safeJsonParse(line)).filter(Boolean);
-    if (events.length === 0) {
-        try {
-            unlinkSync(filePath);
-        }
-        catch { }
-        return;
-    }
+/**
+ * Read chapter/token-offset carried forward on the (possibly synthetic)
+ * SessionStart event. Absent on a first, never-chunked session → chapter 0,
+ * zero offset, which reproduces the original single-transaction behaviour.
+ */
+function readCarry(events) {
+    const start = events.find((e) => e.hook_event_name === "SessionStart");
+    return {
+        chapterIndex: start?._chapter || 0,
+        offsetInput: start?._offsetIn || 0,
+        offsetOutput: start?._offsetOut || 0,
+    };
+}
+/**
+ * Build the transaction tree for a set of events and flush it to Sentry.
+ * Returns the cumulative transcript token totals observed, so the caller can
+ * carry them forward as the next chapter's offset (avoids double-counting
+ * tokens, since the transcript accumulates across chapters).
+ */
+async function emitTransaction(events, config, carry, ongoing) {
     const sessionStart = events.find((e) => e.hook_event_name === "SessionStart");
     const model = sessionStart?.model || events[0]?.model || "claude";
+    const sessionId = sessionStart?.session_id || events[0]?.session_id;
     const transcriptPath = sessionStart?.transcript_path || events[0]?.transcript_path;
     const tokenData = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
+    const cumulative = {
+        input: tokenData?.inputTokens ?? carry.offsetInput,
+        output: tokenData?.outputTokens ?? carry.offsetOutput,
+    };
     const toolCalls = pairToolEvents(events);
     const firstTs = events[0]._ts || Date.now() / 1000;
     const lastTs = events[events.length - 1]._ts || Date.now() / 1000;
@@ -176,6 +196,15 @@ async function processBatch(filePath, config) {
     for (const [key, value] of Object.entries(config.tags)) {
         rootAttrs[key] = value;
     }
+    // Chapter metadata (only meaningful when chunking is enabled). session_id lets
+    // you group every chapter of one long session in Sentry.
+    if (sessionId) {
+        rootAttrs["claude.session_id"] = sessionId;
+    }
+    if (carry.chapterIndex > 0 || ongoing) {
+        rootAttrs["claude.session_chapter"] = carry.chapterIndex;
+        rootAttrs["claude.session_ongoing"] = ongoing;
+    }
     const rootSpan = Sentry.startInactiveSpan({
         name: "invoke_agent claude-code",
         op: "gen_ai.invoke_agent",
@@ -183,13 +212,15 @@ async function processBatch(filePath, config) {
         startTime: firstTs,
         attributes: rootAttrs,
     });
-    // Set token data from session transcript
+    // Set token data from session transcript, reported as this chapter's delta.
     if (tokenData) {
-        if (tokenData.inputTokens) {
-            rootSpan.setAttribute("gen_ai.usage.input_tokens", tokenData.inputTokens);
+        const chapterInput = Math.max(0, cumulative.input - carry.offsetInput);
+        const chapterOutput = Math.max(0, cumulative.output - carry.offsetOutput);
+        if (chapterInput) {
+            rootSpan.setAttribute("gen_ai.usage.input_tokens", chapterInput);
         }
-        if (tokenData.outputTokens) {
-            rootSpan.setAttribute("gen_ai.usage.output_tokens", tokenData.outputTokens);
+        if (chapterOutput) {
+            rootSpan.setAttribute("gen_ai.usage.output_tokens", chapterOutput);
         }
         if (tokenData.model) {
             rootSpan.setAttribute("gen_ai.response.model", tokenData.model);
@@ -252,39 +283,127 @@ async function processBatch(filePath, config) {
     rootSpan.setAttribute("gen_ai.tool.call_count", toolCalls.length);
     rootSpan.end(lastTs);
     await Sentry.flush(10_000);
+    return cumulative;
+}
+/** Read events from a batch logfile, dropping blank/corrupt lines. */
+function readBatchEvents(filePath) {
+    if (!existsSync(filePath))
+        return [];
+    const lines = readFileSync(filePath, "utf-8").trim().split("\n");
+    return lines.map((line) => safeJsonParse(line)).filter(Boolean);
+}
+/** Final flush (SessionEnd): emit remaining events, then remove the logfile. */
+async function processBatch(filePath, config) {
+    const events = readBatchEvents(filePath);
+    if (events.length === 0) {
+        try {
+            unlinkSync(filePath);
+        }
+        catch { }
+        return;
+    }
+    await emitTransaction(events, config, readCarry(events), false);
     try {
         unlinkSync(filePath);
     }
     catch { }
 }
+/**
+ * Time-triggered flush for a still-open session: emit everything so far as a
+ * "chapter" transaction, then reset the logfile to a single synthetic
+ * SessionStart that carries the model, transcript path and token offset forward
+ * so the next chapter is a fresh, correctly-accounted transaction.
+ */
+async function processChunk(filePath, config) {
+    const events = readBatchEvents(filePath);
+    // Nothing worth a chapter unless there's real activity beyond the marker.
+    if (events.length <= 1)
+        return;
+    const carry = readCarry(events);
+    const cumulative = await emitTransaction(events, config, carry, true);
+    const start = events.find((e) => e.hook_event_name === "SessionStart");
+    const carried = {
+        hook_event_name: "SessionStart",
+        session_id: start?.session_id || events[0]?.session_id,
+        model: start?.model || events[0]?.model,
+        transcript_path: start?.transcript_path || events[0]?.transcript_path,
+        _ts: Date.now(),
+        _chapter: carry.chapterIndex + 1,
+        _offsetIn: cumulative.input,
+        _offsetOut: cumulative.output,
+    };
+    try {
+        writeFileSync(filePath, JSON.stringify(carried) + "\n");
+    }
+    catch { }
+}
+/** Age in ms of the current chapter (its first/SessionStart event). */
+function chapterAgeMs(filePath) {
+    const events = readBatchEvents(filePath);
+    if (events.length === 0)
+        return 0;
+    const firstTs = events[0]._ts || Date.now();
+    return Date.now() - firstTs;
+}
 // ── Real-time server mode ────────────────────────────────────
 function startServer(config) {
     const PORT = parseInt(process.env.SENTRY_COLLECTOR_PORT || "9876", 10);
     const sessions = new Map();
+    function newRootSpan(sessionId, model, chapter, ongoing) {
+        const rootAttrs = {
+            "gen_ai.agent.name": "claude-code",
+            "gen_ai.request.model": model,
+            "gen_ai.system": "anthropic",
+            "claude.session_id": sessionId,
+        };
+        for (const [key, value] of Object.entries(config.tags)) {
+            rootAttrs[key] = value;
+        }
+        if (chapter > 0 || ongoing) {
+            rootAttrs["claude.session_chapter"] = chapter;
+            rootAttrs["claude.session_ongoing"] = ongoing;
+        }
+        return Sentry.startInactiveSpan({
+            name: "invoke_agent claude-code",
+            op: "gen_ai.invoke_agent",
+            forceTransaction: true,
+            attributes: rootAttrs,
+        });
+    }
+    /**
+     * Close the current chapter of a still-open session and start the next one,
+     * so realtime sessions that never end still report every flushInterval.
+     */
+    function rotateSession(sessionId, session) {
+        if (session.currentTurnSpan) {
+            session.currentTurnSpan.end();
+            session.currentTurnSpan = null;
+        }
+        for (const span of session.pendingTools.values()) {
+            span.end();
+        }
+        session.pendingTools.clear();
+        session.rootSpan.setAttribute("gen_ai.tool.call_count", session.toolCount);
+        session.rootSpan.setAttribute("claude.session_ongoing", true);
+        session.rootSpan.end();
+        Sentry.flush(5_000);
+        session.chapter += 1;
+        session.toolCount = 0;
+        session.rootSpan = newRootSpan(sessionId, session.model, session.chapter, true);
+    }
     function handleEvent(event) {
         const { session_id, hook_event_name: rawEvent, tool_name } = event;
         const hook_event_name = rawEvent.charAt(0).toUpperCase() + rawEvent.slice(1);
         switch (hook_event_name) {
             case "SessionStart": {
-                const rootAttrs = {
-                    "gen_ai.agent.name": "claude-code",
-                    "gen_ai.request.model": event.model || "claude",
-                    "gen_ai.system": "anthropic",
-                };
-                for (const [key, value] of Object.entries(config.tags)) {
-                    rootAttrs[key] = value;
-                }
-                const rootSpan = Sentry.startInactiveSpan({
-                    name: "invoke_agent claude-code",
-                    op: "gen_ai.invoke_agent",
-                    forceTransaction: true,
-                    attributes: rootAttrs,
-                });
+                const model = event.model || "claude";
                 sessions.set(session_id, {
-                    rootSpan,
+                    rootSpan: newRootSpan(session_id, model, 0, false),
                     currentTurnSpan: null,
                     pendingTools: new Map(),
                     toolCount: 0,
+                    model,
+                    chapter: 0,
                 });
                 break;
             }
@@ -396,6 +515,15 @@ function startServer(config) {
     server.listen(PORT, "127.0.0.1", () => {
         // silent
     });
+    // Periodically rotate open sessions so ones that never end still report.
+    if (config.flushIntervalMinutes > 0) {
+        const timer = setInterval(() => {
+            for (const [sessionId, session] of sessions) {
+                rotateSession(sessionId, session);
+            }
+        }, config.flushIntervalMinutes * 60_000);
+        timer.unref();
+    }
     process.on("SIGTERM", async () => {
         server.close();
         for (const [, session] of sessions) {
@@ -486,11 +614,17 @@ async function main() {
     }
     else {
         // Batch mode: append to session-specific JSONL file
-        const logfile = `/tmp/claude-sentry-${sessionId}.jsonl`;
+        const logfile = batchLogPath(sessionId);
         appendFileSync(logfile, JSON.stringify(timestamped) + "\n");
-        // On SessionEnd, process the collected events
         if (hookEvent === "SessionEnd") {
+            // Final flush of whatever remains in the current chapter.
             await processBatch(logfile, config);
+        }
+        else if (config.flushIntervalMinutes > 0 &&
+            chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000) {
+            // Long-lived session: flush the current chapter and start a fresh one so
+            // sessions that never end still report periodically.
+            await processChunk(logfile, config);
         }
     }
 }

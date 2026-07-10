@@ -1,6 +1,14 @@
 import * as Sentry from "@sentry/node";
-import { readFileSync, unlinkSync, existsSync, appendFileSync } from "node:fs";
+import {
+  readFileSync,
+  unlinkSync,
+  existsSync,
+  appendFileSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadPluginConfig, type ResolvedPluginConfig } from "./config.js";
 import { serializeAttribute } from "./serialize.js";
 
@@ -16,6 +24,14 @@ function safeJsonParse(str: string): Record<string, unknown> | null {
 
 function addTimestamp(event: Record<string, unknown>): Record<string, unknown> {
   return { ...event, _ts: Date.now() };
+}
+
+/**
+ * Per-session batch log path. Uses the OS temp dir so it works on Windows too
+ * (the old hardcoded "/tmp" silently dropped everything on Windows).
+ */
+function batchLogPath(sessionId: string): string {
+  return join(tmpdir(), `claude-sentry-${sessionId}.jsonl`);
 }
 
 // ── Transcript token extraction ──────────────────────────────
@@ -181,30 +197,50 @@ function createToolSpan(tool: PairedToolCall, config: ResolvedPluginConfig): voi
 
 // ── Batch mode ───────────────────────────────────────────────
 
-async function processBatch(filePath: string, config: ResolvedPluginConfig): Promise<void> {
-  if (!existsSync(filePath)) {
-    return;
-  }
+interface ChapterCarry {
+  chapterIndex: number;
+  offsetInput: number;
+  offsetOutput: number;
+}
 
-  const lines = readFileSync(filePath, "utf-8").trim().split("\n");
-  const events = lines.map((line) => safeJsonParse(line)).filter(Boolean) as Record<
-    string,
-    unknown
-  >[];
+/**
+ * Read chapter/token-offset carried forward on the (possibly synthetic)
+ * SessionStart event. Absent on a first, never-chunked session → chapter 0,
+ * zero offset, which reproduces the original single-transaction behaviour.
+ */
+function readCarry(events: Record<string, unknown>[]): ChapterCarry {
+  const start = events.find((e) => e.hook_event_name === "SessionStart");
+  return {
+    chapterIndex: (start?._chapter as number) || 0,
+    offsetInput: (start?._offsetIn as number) || 0,
+    offsetOutput: (start?._offsetOut as number) || 0,
+  };
+}
 
-  if (events.length === 0) {
-    try {
-      unlinkSync(filePath);
-    } catch {}
-    return;
-  }
-
+/**
+ * Build the transaction tree for a set of events and flush it to Sentry.
+ * Returns the cumulative transcript token totals observed, so the caller can
+ * carry them forward as the next chapter's offset (avoids double-counting
+ * tokens, since the transcript accumulates across chapters).
+ */
+async function emitTransaction(
+  events: Record<string, unknown>[],
+  config: ResolvedPluginConfig,
+  carry: ChapterCarry,
+  ongoing: boolean,
+): Promise<{ input: number; output: number }> {
   const sessionStart = events.find((e) => e.hook_event_name === "SessionStart");
   const model = (sessionStart?.model as string) || (events[0]?.model as string) || "claude";
+  const sessionId = (sessionStart?.session_id as string) || (events[0]?.session_id as string);
 
   const transcriptPath =
     (sessionStart?.transcript_path as string) || (events[0]?.transcript_path as string);
   const tokenData = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
+
+  const cumulative = {
+    input: tokenData?.inputTokens ?? carry.offsetInput,
+    output: tokenData?.outputTokens ?? carry.offsetOutput,
+  };
 
   const toolCalls = pairToolEvents(events);
 
@@ -227,6 +263,16 @@ async function processBatch(filePath: string, config: ResolvedPluginConfig): Pro
     rootAttrs[key] = value;
   }
 
+  // Chapter metadata (only meaningful when chunking is enabled). session_id lets
+  // you group every chapter of one long session in Sentry.
+  if (sessionId) {
+    rootAttrs["claude.session_id"] = sessionId;
+  }
+  if (carry.chapterIndex > 0 || ongoing) {
+    rootAttrs["claude.session_chapter"] = carry.chapterIndex;
+    rootAttrs["claude.session_ongoing"] = ongoing;
+  }
+
   const rootSpan = Sentry.startInactiveSpan({
     name: "invoke_agent claude-code",
     op: "gen_ai.invoke_agent",
@@ -235,13 +281,15 @@ async function processBatch(filePath: string, config: ResolvedPluginConfig): Pro
     attributes: rootAttrs,
   });
 
-  // Set token data from session transcript
+  // Set token data from session transcript, reported as this chapter's delta.
   if (tokenData) {
-    if (tokenData.inputTokens) {
-      rootSpan.setAttribute("gen_ai.usage.input_tokens", tokenData.inputTokens);
+    const chapterInput = Math.max(0, cumulative.input - carry.offsetInput);
+    const chapterOutput = Math.max(0, cumulative.output - carry.offsetOutput);
+    if (chapterInput) {
+      rootSpan.setAttribute("gen_ai.usage.input_tokens", chapterInput);
     }
-    if (tokenData.outputTokens) {
-      rootSpan.setAttribute("gen_ai.usage.output_tokens", tokenData.outputTokens);
+    if (chapterOutput) {
+      rootSpan.setAttribute("gen_ai.usage.output_tokens", chapterOutput);
     }
     if (tokenData.model) {
       rootSpan.setAttribute("gen_ai.response.model", tokenData.model);
@@ -327,24 +375,139 @@ async function processBatch(filePath: string, config: ResolvedPluginConfig): Pro
 
   await Sentry.flush(10_000);
 
+  return cumulative;
+}
+
+/** Read events from a batch logfile, dropping blank/corrupt lines. */
+function readBatchEvents(filePath: string): Record<string, unknown>[] {
+  if (!existsSync(filePath)) return [];
+  const lines = readFileSync(filePath, "utf-8").trim().split("\n");
+  return lines.map((line) => safeJsonParse(line)).filter(Boolean) as Record<
+    string,
+    unknown
+  >[];
+}
+
+/** Final flush (SessionEnd): emit remaining events, then remove the logfile. */
+async function processBatch(filePath: string, config: ResolvedPluginConfig): Promise<void> {
+  const events = readBatchEvents(filePath);
+  if (events.length === 0) {
+    try {
+      unlinkSync(filePath);
+    } catch {}
+    return;
+  }
+
+  await emitTransaction(events, config, readCarry(events), false);
+
   try {
     unlinkSync(filePath);
   } catch {}
+}
+
+/**
+ * Time-triggered flush for a still-open session: emit everything so far as a
+ * "chapter" transaction, then reset the logfile to a single synthetic
+ * SessionStart that carries the model, transcript path and token offset forward
+ * so the next chapter is a fresh, correctly-accounted transaction.
+ */
+async function processChunk(filePath: string, config: ResolvedPluginConfig): Promise<void> {
+  const events = readBatchEvents(filePath);
+  // Nothing worth a chapter unless there's real activity beyond the marker.
+  if (events.length <= 1) return;
+
+  const carry = readCarry(events);
+  const cumulative = await emitTransaction(events, config, carry, true);
+
+  const start = events.find((e) => e.hook_event_name === "SessionStart");
+  const carried: Record<string, unknown> = {
+    hook_event_name: "SessionStart",
+    session_id: (start?.session_id as string) || (events[0]?.session_id as string),
+    model: (start?.model as string) || (events[0]?.model as string),
+    transcript_path:
+      (start?.transcript_path as string) || (events[0]?.transcript_path as string),
+    _ts: Date.now(),
+    _chapter: carry.chapterIndex + 1,
+    _offsetIn: cumulative.input,
+    _offsetOut: cumulative.output,
+  };
+
+  try {
+    writeFileSync(filePath, JSON.stringify(carried) + "\n");
+  } catch {}
+}
+
+/** Age in ms of the current chapter (its first/SessionStart event). */
+function chapterAgeMs(filePath: string): number {
+  const events = readBatchEvents(filePath);
+  if (events.length === 0) return 0;
+  const firstTs = (events[0]._ts as number) || Date.now();
+  return Date.now() - firstTs;
 }
 
 // ── Real-time server mode ────────────────────────────────────
 
 function startServer(config: ResolvedPluginConfig): void {
   const PORT = parseInt(process.env.SENTRY_COLLECTOR_PORT || "9876", 10);
-  const sessions = new Map<
-    string,
-    {
-      rootSpan: ReturnType<typeof Sentry.startInactiveSpan>;
-      currentTurnSpan: ReturnType<typeof Sentry.startInactiveSpan> | null;
-      pendingTools: Map<string, ReturnType<typeof Sentry.startInactiveSpan>>;
-      toolCount: number;
+  interface SessionState {
+    rootSpan: ReturnType<typeof Sentry.startInactiveSpan>;
+    currentTurnSpan: ReturnType<typeof Sentry.startInactiveSpan> | null;
+    pendingTools: Map<string, ReturnType<typeof Sentry.startInactiveSpan>>;
+    toolCount: number;
+    model: string;
+    chapter: number;
+  }
+  const sessions = new Map<string, SessionState>();
+
+  function newRootSpan(
+    sessionId: string,
+    model: string,
+    chapter: number,
+    ongoing: boolean,
+  ): ReturnType<typeof Sentry.startInactiveSpan> {
+    const rootAttrs: Record<string, string | number | boolean> = {
+      "gen_ai.agent.name": "claude-code",
+      "gen_ai.request.model": model,
+      "gen_ai.system": "anthropic",
+      "claude.session_id": sessionId,
+    };
+    for (const [key, value] of Object.entries(config.tags)) {
+      rootAttrs[key] = value;
     }
-  >();
+    if (chapter > 0 || ongoing) {
+      rootAttrs["claude.session_chapter"] = chapter;
+      rootAttrs["claude.session_ongoing"] = ongoing;
+    }
+    return Sentry.startInactiveSpan({
+      name: "invoke_agent claude-code",
+      op: "gen_ai.invoke_agent",
+      forceTransaction: true,
+      attributes: rootAttrs,
+    });
+  }
+
+  /**
+   * Close the current chapter of a still-open session and start the next one,
+   * so realtime sessions that never end still report every flushInterval.
+   */
+  function rotateSession(sessionId: string, session: SessionState): void {
+    if (session.currentTurnSpan) {
+      session.currentTurnSpan.end();
+      session.currentTurnSpan = null;
+    }
+    for (const span of session.pendingTools.values()) {
+      span.end();
+    }
+    session.pendingTools.clear();
+    session.rootSpan.setAttribute("gen_ai.tool.call_count", session.toolCount);
+    session.rootSpan.setAttribute("claude.session_ongoing", true);
+    session.rootSpan.end();
+    Sentry.flush(5_000);
+
+    session.chapter += 1;
+    session.toolCount = 0;
+    session.rootSpan = newRootSpan(sessionId, session.model, session.chapter, true);
+  }
 
   function handleEvent(event: Record<string, unknown>): void {
     const { session_id, hook_event_name: rawEvent, tool_name } = event as {
@@ -357,26 +520,14 @@ function startServer(config: ResolvedPluginConfig): void {
 
     switch (hook_event_name) {
       case "SessionStart": {
-        const rootAttrs: Record<string, string | number | boolean> = {
-          "gen_ai.agent.name": "claude-code",
-          "gen_ai.request.model": (event.model as string) || "claude",
-          "gen_ai.system": "anthropic",
-        };
-        for (const [key, value] of Object.entries(config.tags)) {
-          rootAttrs[key] = value;
-        }
-
-        const rootSpan = Sentry.startInactiveSpan({
-          name: "invoke_agent claude-code",
-          op: "gen_ai.invoke_agent",
-          forceTransaction: true,
-          attributes: rootAttrs,
-        });
+        const model = (event.model as string) || "claude";
         sessions.set(session_id, {
-          rootSpan,
+          rootSpan: newRootSpan(session_id, model, 0, false),
           currentTurnSpan: null,
           pendingTools: new Map(),
           toolCount: 0,
+          model,
+          chapter: 0,
         });
         break;
       }
@@ -514,6 +665,19 @@ function startServer(config: ResolvedPluginConfig): void {
     // silent
   });
 
+  // Periodically rotate open sessions so ones that never end still report.
+  if (config.flushIntervalMinutes > 0) {
+    const timer = setInterval(
+      () => {
+        for (const [sessionId, session] of sessions) {
+          rotateSession(sessionId, session);
+        }
+      },
+      config.flushIntervalMinutes * 60_000,
+    );
+    timer.unref();
+  }
+
   process.on("SIGTERM", async () => {
     server.close();
     for (const [, session] of sessions) {
@@ -614,12 +778,19 @@ async function main(): Promise<void> {
     } catch {}
   } else {
     // Batch mode: append to session-specific JSONL file
-    const logfile = `/tmp/claude-sentry-${sessionId}.jsonl`;
+    const logfile = batchLogPath(sessionId);
     appendFileSync(logfile, JSON.stringify(timestamped) + "\n");
 
-    // On SessionEnd, process the collected events
     if (hookEvent === "SessionEnd") {
+      // Final flush of whatever remains in the current chapter.
       await processBatch(logfile, config);
+    } else if (
+      config.flushIntervalMinutes > 0 &&
+      chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000
+    ) {
+      // Long-lived session: flush the current chapter and start a fresh one so
+      // sessions that never end still report periodically.
+      await processChunk(logfile, config);
     }
   }
 }
