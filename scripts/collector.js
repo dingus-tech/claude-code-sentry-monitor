@@ -693,6 +693,22 @@ async function main() {
         // Batch mode: append to session-specific JSONL file
         const logfile = batchLogPath(sessionId);
         appendFileSync(logfile, JSON.stringify(timestamped) + "\n");
+        // First time we ever see this session? Seed its token offset from whatever the
+        // transcript already contains, so we never report tokens spent before the plugin
+        // was watching. A brand-new session has an (almost) empty transcript, so this
+        // seeds ~0 and changes nothing. A session resumed with --resume — or any session
+        // that predates the install — already carries its full history, and without this
+        // the first flush would report that entire history as if it were new spend.
+        if (hookEvent === "SessionStart" && !existsSync(offsetPath(sessionId))) {
+            const transcriptPath = event.transcript_path;
+            const priorTokens = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
+            writeCarry(sessionId, 0, {
+                input: priorTokens?.inputTokens ?? 0,
+                cacheWrite: priorTokens?.cacheCreationTokens ?? 0,
+                cacheRead: priorTokens?.cacheReadTokens ?? 0,
+                output: priorTokens?.outputTokens ?? 0,
+            });
+        }
         if (hookEvent === "SessionEnd") {
             // Final flush of whatever remains in the current chapter.
             await initSentry(config);
