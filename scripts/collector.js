@@ -63,6 +63,12 @@ function extractTokensFromTranscript(transcriptPath) {
     const turnResponses = [];
     let currentTurnResponse = null;
     let inTurn = false;
+    // A single API response is written to the transcript as one line per content
+    // block — thinking, text, tool_use — and every one of those lines repeats the
+    // same `usage` object. Summing them all bills one response several times over
+    // (measured: 2.3x on output, 1.9x on cache reads). The message id is what
+    // identifies the response, so count each id once.
+    const countedMessageIds = new Set();
     const content = readFileSync(transcriptPath, "utf-8");
     for (const line of content.split("\n")) {
         if (!line)
@@ -98,6 +104,12 @@ function extractTokensFromTranscript(transcriptPath) {
         }
         if (obj.type !== "assistant" || !obj.message?.usage)
             continue;
+        const messageId = obj.message?.id;
+        if (messageId) {
+            if (countedMessageIds.has(messageId))
+                continue;
+            countedMessageIds.add(messageId);
+        }
         const usage = obj.message.usage;
         // Keep the three input buckets separate: they have very different costs, and
         // in long sessions cache reads dwarf everything else (the same context is
