@@ -1,4 +1,4 @@
-import { readFileSync, unlinkSync, existsSync, appendFileSync, writeFileSync, } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, appendFileSync, writeFileSync, openSync, closeSync, statSync, } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,6 +207,54 @@ const ZERO_CARRY = {
     chapterIndex: 0,
     offset: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 },
 };
+/** A lock held longer than this is assumed to belong to a process that died. */
+const LOCK_STALE_MS = 2 * 60_000;
+function lockPath(sessionId) {
+    return join(tmpdir(), `claude-sentry-${sessionId}.lock`);
+}
+/**
+ * Take an exclusive, cross-process lock on a session's flush.
+ *
+ * Claude Code runs tool calls in parallel, so several hook processes fire at the
+ * same instant. Flushing reads the batch log, awaits a network round-trip to
+ * Sentry, and only then advances the offset — so without a lock every one of
+ * those processes sees the same un-advanced offset and emits the same chapter.
+ * Observed in production: five identical transactions, same timestamp, same
+ * token counts, five distinct trace ids.
+ *
+ * `wx` fails if the file already exists, and that check-and-create is atomic on
+ * both Windows and POSIX, so exactly one process wins. The losers skip this
+ * flush; their events stay in the log and land in the next chapter.
+ */
+function acquireFlushLock(sessionId) {
+    const path = lockPath(sessionId);
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            closeSync(openSync(path, "wx"));
+            return true;
+        }
+        catch {
+            // Held by someone. If that someone died mid-flush the lock would never be
+            // released and the session would stop reporting, so drop a stale one and
+            // retry exactly once.
+            try {
+                if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) {
+                    unlinkSync(path);
+                    continue;
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+    return false;
+}
+function releaseFlushLock(sessionId) {
+    try {
+        unlinkSync(lockPath(sessionId));
+    }
+    catch { }
+}
 /**
  * Read the chapter index and token totals already reported for this session.
  * Survives SessionEnd so that resuming a session reports only new tokens.
@@ -256,6 +304,17 @@ async function emitTransaction(events, config, carry, ongoing) {
         output: tokenData?.outputTokens ?? carry.offset.output,
     };
     const toolCalls = pairToolEvents(events);
+    // A chapter that spent no tokens and ran no tools has nothing to say. It shows
+    // up when a flush loses a race — the winner already advanced the offset, so the
+    // straggler computes a zero delta — and publishing it just litters the dashboard
+    // with empty transactions that look like duplicates of the real one.
+    const spent = cumulative.input - carry.offset.input +
+        (cumulative.cacheWrite - carry.offset.cacheWrite) +
+        (cumulative.cacheRead - carry.offset.cacheRead) +
+        (cumulative.output - carry.offset.output);
+    if (spent <= 0 && toolCalls.length === 0) {
+        return cumulative;
+    }
     const firstTs = events[0]._ts || Date.now() / 1000;
     const lastTs = events[events.length - 1]._ts || Date.now() / 1000;
     // Find UserPromptSubmit event indices for turn-based tracing
@@ -391,21 +450,34 @@ function readBatchEvents(filePath) {
  * later resume of this session doesn't re-report them, then remove the logfile.
  */
 async function processBatch(filePath, config, sessionId) {
-    const events = readBatchEvents(filePath);
-    if (events.length === 0) {
+    if (readBatchEvents(filePath).length === 0) {
         try {
             unlinkSync(filePath);
         }
         catch { }
         return;
     }
-    const carry = readCarry(sessionId);
-    const cumulative = await emitTransaction(events, config, carry, false);
-    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+    if (!acquireFlushLock(sessionId))
+        return;
     try {
-        unlinkSync(filePath);
+        // Re-read under the lock. Whoever held it before us has already emitted and
+        // deleted the log, and emitting the copy we read on the way in would publish
+        // that same chapter a second time (as an empty transaction, since the offset
+        // it advanced leaves us a zero delta).
+        const events = readBatchEvents(filePath);
+        if (events.length === 0)
+            return;
+        const carry = readCarry(sessionId);
+        const cumulative = await emitTransaction(events, config, carry, false);
+        writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+        try {
+            unlinkSync(filePath);
+        }
+        catch { }
     }
-    catch { }
+    finally {
+        releaseFlushLock(sessionId);
+    }
 }
 /**
  * Time-triggered flush for a still-open session: emit everything so far as a
@@ -414,25 +486,36 @@ async function processBatch(filePath, config, sessionId) {
  * so the next chapter is a fresh, correctly-accounted transaction.
  */
 async function processChunk(filePath, config, sessionId) {
-    const events = readBatchEvents(filePath);
     // Nothing worth a chapter unless there's real activity beyond the marker.
-    if (events.length <= 1)
+    if (readBatchEvents(filePath).length <= 1)
         return;
-    const carry = readCarry(sessionId);
-    const cumulative = await emitTransaction(events, config, carry, true);
-    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
-    const start = events.find((e) => e.hook_event_name === "SessionStart");
-    const carried = {
-        hook_event_name: "SessionStart",
-        session_id: sessionId,
-        model: start?.model || events[0]?.model,
-        transcript_path: start?.transcript_path || events[0]?.transcript_path,
-        _ts: Date.now(),
-    };
+    if (!acquireFlushLock(sessionId))
+        return;
     try {
-        writeFileSync(filePath, JSON.stringify(carried) + "\n");
+        // Re-read under the lock: parallel hooks may have appended since the check
+        // above, and whoever lost the race left their events here for us.
+        const events = readBatchEvents(filePath);
+        if (events.length <= 1)
+            return;
+        const carry = readCarry(sessionId);
+        const cumulative = await emitTransaction(events, config, carry, true);
+        writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+        const start = events.find((e) => e.hook_event_name === "SessionStart");
+        const carried = {
+            hook_event_name: "SessionStart",
+            session_id: sessionId,
+            model: start?.model || events[0]?.model,
+            transcript_path: start?.transcript_path || events[0]?.transcript_path,
+            _ts: Date.now(),
+        };
+        try {
+            writeFileSync(filePath, JSON.stringify(carried) + "\n");
+        }
+        catch { }
     }
-    catch { }
+    finally {
+        releaseFlushLock(sessionId);
+    }
 }
 /** Age in ms of the current chapter (its first/SessionStart event). */
 function chapterAgeMs(filePath) {
