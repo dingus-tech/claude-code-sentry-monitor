@@ -1,4 +1,4 @@
-import { readFileSync, unlinkSync, existsSync, appendFileSync, writeFileSync, openSync, closeSync, statSync, } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, appendFileSync, writeFileSync, openSync, closeSync, readSync, statSync, } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,6 +49,148 @@ function batchLogPath(sessionId) {
  */
 function offsetPath(sessionId) {
     return join(tmpdir(), `claude-sentry-${sessionId}.offset.json`);
+}
+function readStatePath(sessionId) {
+    return join(tmpdir(), `claude-sentry-${sessionId}.readstate.json`);
+}
+function loadReadState(sessionId, path) {
+    const fresh = {
+        path,
+        bytesRead: 0,
+        input: 0,
+        cacheWrite: 0,
+        cacheRead: 0,
+        output: 0,
+        model: null,
+        lastMessageId: null,
+    };
+    try {
+        const parsed = safeJsonParse(readFileSync(readStatePath(sessionId), "utf-8"));
+        if (!parsed || typeof parsed !== "object")
+            return fresh;
+        const s = parsed;
+        // A different transcript, or a file that shrank (truncated/rotated), means
+        // our saved offset is meaningless — start over from the top.
+        if (s.path !== path || typeof s.bytesRead !== "number")
+            return fresh;
+        const size = statSync(path).size;
+        if (size < s.bytesRead)
+            return fresh;
+        return { ...fresh, ...s, path };
+    }
+    catch {
+        return fresh;
+    }
+}
+function saveReadState(sessionId, state) {
+    try {
+        writeFileSync(readStatePath(sessionId), JSON.stringify(state));
+    }
+    catch { }
+}
+/**
+ * Seed the read state at the current end of the transcript with zero totals, so
+ * the plugin reports only tokens spent from now on. Used at SessionStart for a
+ * resumed (or pre-existing) session whose transcript already holds history we
+ * were never watching. Costs a stat(), not a full read — this is what removes
+ * the startup freeze on a large transcript.
+ */
+function seedReadStateAtEnd(sessionId, path) {
+    let size = 0;
+    try {
+        size = statSync(path).size;
+    }
+    catch { }
+    saveReadState(sessionId, {
+        path,
+        bytesRead: size,
+        input: 0,
+        cacheWrite: 0,
+        cacheRead: 0,
+        output: 0,
+        model: null,
+        lastMessageId: null,
+    });
+}
+/**
+ * Incremental token-only read: parse just the bytes appended to the transcript
+ * since the last read, add their (message-id-deduped) usage to the running
+ * totals in the read state, and return the cumulative totals. This is the fast
+ * path used whenever prompt/response content is not being recorded — i.e. the
+ * default and the team's privacy setting. It never re-reads the whole file, so
+ * a flush on a multi-hundred-MB transcript stays instant.
+ */
+function extractTokensIncremental(transcriptPath, sessionId) {
+    if (!existsSync(transcriptPath))
+        return null;
+    const state = loadReadState(sessionId, transcriptPath);
+    let size = 0;
+    try {
+        size = statSync(transcriptPath).size;
+    }
+    catch {
+        return null;
+    }
+    // Read only [bytesRead, size). Stop at the last newline so a half-written
+    // trailing line is left for the next read instead of being parsed truncated.
+    if (size > state.bytesRead) {
+        let chunk = "";
+        try {
+            const fd = openSync(transcriptPath, "r");
+            try {
+                const len = size - state.bytesRead;
+                const buf = Buffer.allocUnsafe(len);
+                readSync(fd, buf, 0, len, state.bytesRead);
+                chunk = buf.toString("utf-8");
+            }
+            finally {
+                closeSync(fd);
+            }
+        }
+        catch {
+            return null;
+        }
+        const lastNl = chunk.lastIndexOf("\n");
+        if (lastNl >= 0) {
+            const consumed = chunk.slice(0, lastNl);
+            for (const line of consumed.split("\n")) {
+                if (!line)
+                    continue;
+                const obj = safeJsonParse(line);
+                if (!obj)
+                    continue;
+                if (obj.type !== "assistant" || !obj.message?.usage)
+                    continue;
+                const messageId = obj.message?.id;
+                // Skip a repeated line of the same response, including one whose lines
+                // straddle the boundary between this read and the previous one.
+                if (messageId && messageId === state.lastMessageId)
+                    continue;
+                if (messageId)
+                    state.lastMessageId = messageId;
+                const usage = obj.message.usage;
+                state.input += usage.input_tokens || 0;
+                state.cacheWrite += usage.cache_creation_input_tokens || 0;
+                state.cacheRead += usage.cache_read_input_tokens || 0;
+                state.output += usage.output_tokens || 0;
+                if (obj.message.model)
+                    state.model = obj.message.model;
+            }
+            // Advance only past the newline we actually consumed.
+            state.bytesRead += Buffer.byteLength(consumed + "\n", "utf-8");
+        }
+        saveReadState(sessionId, state);
+    }
+    return {
+        inputTokens: state.input,
+        cacheCreationTokens: state.cacheWrite,
+        cacheReadTokens: state.cacheRead,
+        outputTokens: state.output,
+        model: state.model,
+        prompt: null,
+        lastResponse: null,
+        turnResponses: [],
+    };
 }
 function extractTokensFromTranscript(transcriptPath) {
     if (!existsSync(transcriptPath))
@@ -296,7 +438,14 @@ async function emitTransaction(events, config, carry, ongoing) {
     const model = sessionStart?.model || events[0]?.model || "claude";
     const sessionId = sessionStart?.session_id || events[0]?.session_id;
     const transcriptPath = sessionStart?.transcript_path || events[0]?.transcript_path;
-    const tokenData = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
+    // Fast incremental path unless we actually need prompt/response text (which
+    // requires reading the whole transcript). Recording content is off by default.
+    const needContent = config.recordInputs || config.recordOutputs;
+    const tokenData = transcriptPath
+        ? needContent || !sessionId
+            ? extractTokensFromTranscript(transcriptPath)
+            : extractTokensIncremental(transcriptPath, sessionId)
+        : null;
     const cumulative = {
         input: tokenData?.inputTokens ?? carry.offset.input,
         cacheWrite: tokenData?.cacheCreationTokens ?? carry.offset.cacheWrite,
@@ -796,13 +945,23 @@ async function main() {
         // the first flush would report that entire history as if it were new spend.
         if (hookEvent === "SessionStart" && !existsSync(offsetPath(sessionId))) {
             const transcriptPath = event.transcript_path;
-            const priorTokens = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
-            writeCarry(sessionId, 0, {
-                input: priorTokens?.inputTokens ?? 0,
-                cacheWrite: priorTokens?.cacheCreationTokens ?? 0,
-                cacheRead: priorTokens?.cacheReadTokens ?? 0,
-                output: priorTokens?.outputTokens ?? 0,
-            });
+            const needContent = config.recordInputs || config.recordOutputs;
+            if (transcriptPath && !needContent) {
+                // Fast path: mark the read state at end-of-transcript (a stat, not a
+                // read) so we count only tokens spent from here on. This is what keeps
+                // resuming a huge session from freezing at startup.
+                seedReadStateAtEnd(sessionId, transcriptPath);
+                writeCarry(sessionId, 0, { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 });
+            }
+            else {
+                const priorTokens = transcriptPath ? extractTokensFromTranscript(transcriptPath) : null;
+                writeCarry(sessionId, 0, {
+                    input: priorTokens?.inputTokens ?? 0,
+                    cacheWrite: priorTokens?.cacheCreationTokens ?? 0,
+                    cacheRead: priorTokens?.cacheReadTokens ?? 0,
+                    output: priorTokens?.outputTokens ?? 0,
+                });
+            }
         }
         if (hookEvent === "SessionEnd") {
             // Final flush of whatever remains in the current chapter.
