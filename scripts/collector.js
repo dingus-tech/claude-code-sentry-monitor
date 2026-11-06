@@ -647,18 +647,28 @@ async function processChunk(filePath, config, sessionId) {
         if (events.length <= 1)
             return;
         const carry = readCarry(sessionId);
-        const cumulative = await emitTransaction(events, config, carry, true);
-        writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
         const start = events.find((e) => e.hook_event_name === "SessionStart");
-        const carried = {
-            hook_event_name: "SessionStart",
-            session_id: sessionId,
-            model: start?.model || events[0]?.model,
-            transcript_path: start?.transcript_path || events[0]?.transcript_path,
-            _ts: Date.now(),
-        };
+        let cumulative;
         try {
-            writeFileSync(filePath, JSON.stringify(carried) + "\n");
+            cumulative = await emitTransaction(events, config, carry, true);
+        }
+        catch (err) {
+            // Sentry unreachable (network down, ingest returning 5xx…). Keep the chapter
+            // to retry on the next hook — but not forever: a session that kept failing
+            // grew one chapter to 900 MB. Past the cap, drop its tool spans and start a
+            // new one. The carry is not advanced, so the tokens of the dropped chapter
+            // are still counted in the next one that gets through.
+            if (fileSize(filePath) > MAX_UNSENT_CHAPTER_BYTES) {
+                try {
+                    writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
+                }
+                catch { }
+            }
+            throw err;
+        }
+        writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+        try {
+            writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
         }
         catch { }
     }
@@ -667,12 +677,107 @@ async function processChunk(filePath, config, sessionId) {
     }
 }
 /** Age in ms of the current chapter (its first/SessionStart event). */
-function chapterAgeMs(filePath) {
-    const events = readBatchEvents(filePath);
-    if (events.length === 0)
+/**
+ * Largest chapter kept on disk while Sentry can't be reached. With tool payloads
+ * slimmed a line is a few hundred bytes, so this is tens of thousands of events.
+ */
+const MAX_UNSENT_CHAPTER_BYTES = 8 * 1024 * 1024;
+function fileSize(filePath) {
+    try {
+        return statSync(filePath).size;
+    }
+    catch {
         return 0;
-    const firstTs = events[0]._ts || Date.now();
+    }
+}
+/** The first line of a new chapter: what the next flush needs from the session start. */
+function chapterMarker(sessionId, start, events) {
+    return {
+        hook_event_name: "SessionStart",
+        session_id: sessionId,
+        model: start?.model || events[0]?.model,
+        transcript_path: start?.transcript_path || events[0]?.transcript_path,
+        _ts: Date.now(),
+    };
+}
+/**
+ * Age of the current chapter, from the timestamp of its first event.
+ *
+ * Runs on every hook of a long-lived session, so it reads only the first line.
+ * Parsing the whole logfile here made every hook cost as much as the chapter was
+ * big: once a chapter failed to flush and kept growing (one reached 900 MB), each
+ * tool call started a process holding well over 1 GB, and a busy session ran a
+ * dozen of them at once.
+ */
+function chapterAgeMs(filePath) {
+    const first = readFirstLine(filePath);
+    if (!first)
+        return 0;
+    const event = safeJsonParse(first);
+    const firstTs = event?._ts || Date.now();
     return Date.now() - firstTs;
+}
+/** First line of a file, reading only as much of it as needed. */
+function readFirstLine(filePath) {
+    let fd;
+    try {
+        fd = openSync(filePath, "r");
+    }
+    catch {
+        return "";
+    }
+    try {
+        const chunk = Buffer.alloc(64 * 1024);
+        const parts = [];
+        let pos = 0;
+        for (;;) {
+            const n = readSync(fd, chunk, 0, chunk.length, pos);
+            if (n === 0)
+                break;
+            const nl = chunk.subarray(0, n).indexOf(0x0a);
+            if (nl !== -1) {
+                parts.push(Buffer.from(chunk.subarray(0, nl)));
+                break;
+            }
+            parts.push(Buffer.from(chunk.subarray(0, n)));
+            pos += n;
+        }
+        return Buffer.concat(parts).toString("utf-8").trim();
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+/**
+ * What the batch logfile keeps of a tool event.
+ *
+ * The raw hook payload carries the whole tool input and response (a file read, a
+ * command's output: several MB per line is common), but the flush only ever uses
+ * them through serializeAttribute(…, maxAttributeLength), and only when recording
+ * is on. Storing them already reduced keeps the logfile small; with recording off
+ * they are not stored at all.
+ */
+function slimForBatch(event, config) {
+    if (!("tool_input" in event) && !("tool_response" in event))
+        return event;
+    const slim = { ...event };
+    if ("tool_input" in slim) {
+        if (config.recordInputs && slim.tool_input) {
+            slim.tool_input = serializeAttribute(slim.tool_input, config.maxAttributeLength);
+        }
+        else {
+            delete slim.tool_input;
+        }
+    }
+    if ("tool_response" in slim) {
+        if (config.recordOutputs && slim.tool_response) {
+            slim.tool_response = serializeAttribute(slim.tool_response, config.maxAttributeLength);
+        }
+        else {
+            delete slim.tool_response;
+        }
+    }
+    return slim;
 }
 // ── Real-time server mode ────────────────────────────────────
 function startServer(config) {
@@ -936,7 +1041,7 @@ async function main() {
     else {
         // Batch mode: append to session-specific JSONL file
         const logfile = batchLogPath(sessionId);
-        appendFileSync(logfile, JSON.stringify(timestamped) + "\n");
+        appendFileSync(logfile, JSON.stringify(slimForBatch(timestamped, config)) + "\n");
         // First time we ever see this session? Seed its token offset from whatever the
         // transcript already contains, so we never report tokens spent before the plugin
         // was watching. A brand-new session has an (almost) empty transcript, so this
