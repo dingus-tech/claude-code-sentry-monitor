@@ -584,7 +584,12 @@ async function emitTransaction(events, config, carry, ongoing) {
     }
     rootSpan.setAttribute("gen_ai.tool.call_count", toolCalls.length);
     rootSpan.end(lastTs);
-    await Sentry.flush(10_000);
+    // flush() resolves false (it does not throw) when Sentry doesn't answer in time.
+    // Treating that as sent would advance the carry and drop the chapter, so make
+    // it a failure the caller keeps the chapter for.
+    if (!(await Sentry.flush(10_000))) {
+        throw new Error("Sentry did not acknowledge the flush");
+    }
     return cumulative;
 }
 /** Read events from a batch logfile, dropping blank/corrupt lines. */
@@ -658,15 +663,19 @@ async function processChunk(filePath, config, sessionId) {
             // grew one chapter to 900 MB. Past the cap, drop its tool spans and start a
             // new one. The carry is not advanced, so the tokens of the dropped chapter
             // are still counted in the next one that gets through.
+            // Events other hooks append between our read and this write are lost, as
+            // they already were on a normal chapter reset.
             if (fileSize(filePath) > MAX_UNSENT_CHAPTER_BYTES) {
                 try {
                     writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
                 }
                 catch { }
             }
+            markFlushFailed(sessionId);
             throw err;
         }
         writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+        clearFlushFailed(sessionId);
         try {
             writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
         }
@@ -676,7 +685,36 @@ async function processChunk(filePath, config, sessionId) {
         releaseFlushLock(sessionId);
     }
 }
-/** Age in ms of the current chapter (its first/SessionStart event). */
+function retryPath(sessionId) {
+    return join(tmpdir(), `claude-sentry-${sessionId}.retry`);
+}
+/**
+ * Remember that a periodic flush just failed, so the next hooks don't retry at
+ * once: the chapter's first event stays old after a failure, and without this
+ * every hook would load Sentry, re-read the chapter and wait up to 10 s again.
+ */
+function markFlushFailed(sessionId) {
+    try {
+        writeFileSync(retryPath(sessionId), String(Date.now()));
+    }
+    catch { }
+}
+function clearFlushFailed(sessionId) {
+    try {
+        unlinkSync(retryPath(sessionId));
+    }
+    catch { }
+}
+/** Ms since the last failed periodic flush, or Infinity if none is recorded. */
+function msSinceFailedFlush(sessionId) {
+    try {
+        const at = Number(readFileSync(retryPath(sessionId), "utf-8"));
+        return Number.isFinite(at) ? Date.now() - at : Infinity;
+    }
+    catch {
+        return Infinity;
+    }
+}
 /**
  * Largest chapter kept on disk while Sentry can't be reached. With tool payloads
  * slimmed a line is a few hundred bytes, so this is tens of thousands of events.
@@ -1074,7 +1112,8 @@ async function main() {
             await processBatch(logfile, config, sessionId);
         }
         else if (config.flushIntervalMinutes > 0 &&
-            chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000) {
+            chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000 &&
+            msSinceFailedFlush(sessionId) >= config.flushIntervalMinutes * 60_000) {
             // Long-lived session: flush the current chapter and start a fresh one so
             // sessions that never end still report periodically.
             await initSentry(config);
