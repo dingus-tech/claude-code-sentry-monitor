@@ -717,7 +717,12 @@ async function emitTransaction(
   rootSpan.setAttribute("gen_ai.tool.call_count", toolCalls.length);
   rootSpan.end(lastTs);
 
-  await Sentry.flush(10_000);
+  // flush() resolves false (it does not throw) when Sentry doesn't answer in time.
+  // Treating that as sent would advance the carry and drop the chapter, so make
+  // it a failure the caller keeps the chapter for.
+  if (!(await Sentry.flush(10_000))) {
+    throw new Error("Sentry did not acknowledge the flush");
+  }
 
   return cumulative;
 }
@@ -791,33 +796,174 @@ async function processChunk(
     if (events.length <= 1) return;
 
     const carry = readCarry(sessionId);
-    const cumulative = await emitTransaction(events, config, carry, true);
-    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
-
     const start = events.find((e) => e.hook_event_name === "SessionStart");
-    const carried: Record<string, unknown> = {
-      hook_event_name: "SessionStart",
-      session_id: sessionId,
-      model: (start?.model as string) || (events[0]?.model as string),
-      transcript_path:
-        (start?.transcript_path as string) || (events[0]?.transcript_path as string),
-      _ts: Date.now(),
-    };
+    let cumulative: TokenTotals;
+    try {
+      cumulative = await emitTransaction(events, config, carry, true);
+    } catch (err) {
+      // Sentry unreachable (network down, ingest returning 5xx…). Keep the chapter
+      // to retry on the next hook — but not forever: a session that kept failing
+      // grew one chapter to 900 MB. Past the cap, drop its tool spans and start a
+      // new one. The carry is not advanced, so the tokens of the dropped chapter
+      // are still counted in the next one that gets through.
+      // Events other hooks append between our read and this write are lost, as
+      // they already were on a normal chapter reset.
+      if (fileSize(filePath) > MAX_UNSENT_CHAPTER_BYTES) {
+        try {
+          writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
+        } catch {}
+      }
+      markFlushFailed(sessionId);
+      throw err;
+    }
+    writeCarry(sessionId, carry.chapterIndex + 1, cumulative);
+    clearFlushFailed(sessionId);
 
     try {
-      writeFileSync(filePath, JSON.stringify(carried) + "\n");
+      writeFileSync(filePath, JSON.stringify(chapterMarker(sessionId, start, events)) + "\n");
     } catch {}
   } finally {
     releaseFlushLock(sessionId);
   }
 }
 
-/** Age in ms of the current chapter (its first/SessionStart event). */
+function retryPath(sessionId: string): string {
+  return join(tmpdir(), `claude-sentry-${sessionId}.retry`);
+}
+
+/**
+ * Remember that a periodic flush just failed, so the next hooks don't retry at
+ * once: the chapter's first event stays old after a failure, and without this
+ * every hook would load Sentry, re-read the chapter and wait up to 10 s again.
+ */
+function markFlushFailed(sessionId: string): void {
+  try {
+    writeFileSync(retryPath(sessionId), String(Date.now()));
+  } catch {}
+}
+
+function clearFlushFailed(sessionId: string): void {
+  try {
+    unlinkSync(retryPath(sessionId));
+  } catch {}
+}
+
+/** Ms since the last failed periodic flush, or Infinity if none is recorded. */
+function msSinceFailedFlush(sessionId: string): number {
+  try {
+    const at = Number(readFileSync(retryPath(sessionId), "utf-8"));
+    return Number.isFinite(at) ? Date.now() - at : Infinity;
+  } catch {
+    return Infinity;
+  }
+}
+
+/**
+ * Largest chapter kept on disk while Sentry can't be reached. With tool payloads
+ * slimmed a line is a few hundred bytes, so this is tens of thousands of events.
+ */
+const MAX_UNSENT_CHAPTER_BYTES = 8 * 1024 * 1024;
+
+function fileSize(filePath: string): number {
+  try {
+    return statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** The first line of a new chapter: what the next flush needs from the session start. */
+function chapterMarker(
+  sessionId: string,
+  start: Record<string, unknown> | undefined,
+  events: Record<string, unknown>[],
+): Record<string, unknown> {
+  return {
+    hook_event_name: "SessionStart",
+    session_id: sessionId,
+    model: (start?.model as string) || (events[0]?.model as string),
+    transcript_path:
+      (start?.transcript_path as string) || (events[0]?.transcript_path as string),
+    _ts: Date.now(),
+  };
+}
+
+/**
+ * Age of the current chapter, from the timestamp of its first event.
+ *
+ * Runs on every hook of a long-lived session, so it reads only the first line.
+ * Parsing the whole logfile here made every hook cost as much as the chapter was
+ * big: once a chapter failed to flush and kept growing (one reached 900 MB), each
+ * tool call started a process holding well over 1 GB, and a busy session ran a
+ * dozen of them at once.
+ */
 function chapterAgeMs(filePath: string): number {
-  const events = readBatchEvents(filePath);
-  if (events.length === 0) return 0;
-  const firstTs = (events[0]._ts as number) || Date.now();
+  const first = readFirstLine(filePath);
+  if (!first) return 0;
+  const event = safeJsonParse(first);
+  const firstTs = (event?._ts as number) || Date.now();
   return Date.now() - firstTs;
+}
+
+/** First line of a file, reading only as much of it as needed. */
+function readFirstLine(filePath: string): string {
+  let fd: number;
+  try {
+    fd = openSync(filePath, "r");
+  } catch {
+    return "";
+  }
+  try {
+    const chunk = Buffer.alloc(64 * 1024);
+    const parts: Buffer[] = [];
+    let pos = 0;
+    for (;;) {
+      const n = readSync(fd, chunk, 0, chunk.length, pos);
+      if (n === 0) break;
+      const nl = chunk.subarray(0, n).indexOf(0x0a);
+      if (nl !== -1) {
+        parts.push(Buffer.from(chunk.subarray(0, nl)));
+        break;
+      }
+      parts.push(Buffer.from(chunk.subarray(0, n)));
+      pos += n;
+    }
+    return Buffer.concat(parts).toString("utf-8").trim();
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * What the batch logfile keeps of a tool event.
+ *
+ * The raw hook payload carries the whole tool input and response (a file read, a
+ * command's output: several MB per line is common), but the flush only ever uses
+ * them through serializeAttribute(…, maxAttributeLength), and only when recording
+ * is on. Storing them already reduced keeps the logfile small; with recording off
+ * they are not stored at all.
+ */
+function slimForBatch(
+  event: Record<string, unknown>,
+  config: ResolvedPluginConfig,
+): Record<string, unknown> {
+  if (!("tool_input" in event) && !("tool_response" in event)) return event;
+  const slim = { ...event };
+  if ("tool_input" in slim) {
+    if (config.recordInputs && slim.tool_input) {
+      slim.tool_input = serializeAttribute(slim.tool_input, config.maxAttributeLength);
+    } else {
+      delete slim.tool_input;
+    }
+  }
+  if ("tool_response" in slim) {
+    if (config.recordOutputs && slim.tool_response) {
+      slim.tool_response = serializeAttribute(slim.tool_response, config.maxAttributeLength);
+    } else {
+      delete slim.tool_response;
+    }
+  }
+  return slim;
 }
 
 // ── Real-time server mode ────────────────────────────────────
@@ -1145,7 +1291,7 @@ async function main(): Promise<void> {
   } else {
     // Batch mode: append to session-specific JSONL file
     const logfile = batchLogPath(sessionId);
-    appendFileSync(logfile, JSON.stringify(timestamped) + "\n");
+    appendFileSync(logfile, JSON.stringify(slimForBatch(timestamped, config)) + "\n");
 
     // First time we ever see this session? Seed its token offset from whatever the
     // transcript already contains, so we never report tokens spent before the plugin
@@ -1179,7 +1325,8 @@ async function main(): Promise<void> {
       await processBatch(logfile, config, sessionId);
     } else if (
       config.flushIntervalMinutes > 0 &&
-      chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000
+      chapterAgeMs(logfile) >= config.flushIntervalMinutes * 60_000 &&
+      msSinceFailedFlush(sessionId) >= config.flushIntervalMinutes * 60_000
     ) {
       // Long-lived session: flush the current chapter and start a fresh one so
       // sessions that never end still report periodically.
